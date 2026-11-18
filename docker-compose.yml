@@ -1,0 +1,134 @@
+name: loopr-export
+
+# Settings shared by every backend process.
+x-backend: &backend
+  build:
+    context: ./backend
+    target: runtime
+  image: loopr-export-backend
+  restart: unless-stopped
+  environment: &backend-env
+    DATABASE_URL: postgres://loopr:loopr@postgres:5432/loopr
+    REDIS_URL: redis://redis:6379
+    STORAGE_DIR: /data
+    LOG_LEVEL: info
+  volumes:
+    - export-data:/data
+  depends_on:
+    migrate:
+      condition: service_completed_successfully
+    redis:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: loopr
+      POSTGRES_PASSWORD: loopr
+      POSTGRES_DB: loopr
+    ports:
+      - "${POSTGRES_PORT:-55432}:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U loopr -d loopr"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    # appendonly keeps queued messages if Redis restarts (PostgreSQL is still the source of truth).
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${REDIS_PORT:-56379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # Runs database migrations once, then exits.
+  migrate:
+    <<: *backend
+    restart: "no"
+    command: ["node", "dist/bin/migrate.js"]
+    environment:
+      <<: *backend-env
+      SERVICE_NAME: migrate
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    <<: *backend
+    command: ["node", "dist/bin/api.js"]
+    environment:
+      <<: *backend-env
+      SERVICE_NAME: api
+      # Demo only: lets the UI add fake inspection records. Never enable in production.
+      DEMO_TOOLS: "true"
+    ports:
+      - "${API_PORT:-3000}:3000"
+
+  # Publishes the outbox to BullMQ and repairs stuck work (expired leases, lost messages).
+  dispatcher:
+    <<: *backend
+    command: ["node", "dist/bin/dispatcher.js"]
+    environment:
+      <<: *backend-env
+      SERVICE_NAME: dispatcher
+
+  # Closes time windows, starts scheduled and correction exports.
+  scheduler:
+    <<: *backend
+    command: ["node", "dist/bin/scheduler.js"]
+    environment:
+      <<: *backend-env
+      SERVICE_NAME: scheduler
+
+  # Runs export tasks. Scale with: docker compose up -d --scale worker=5
+  worker:
+    <<: *backend
+    command: ["node", "dist/bin/worker.js"]
+    environment:
+      <<: *backend-env
+      SERVICE_NAME: worker
+      WORKER_CONCURRENCY: 4
+      TASK_LEASE_SECONDS: ${TASK_LEASE_SECONDS:-60}
+      # Demo only: see "Watch a crash and the recovery" in the README.
+      DEMO_CRASH_CHUNK: ${DEMO_CRASH_CHUNK:-}
+    deploy:
+      replicas: 3
+
+  # React UI (nginx). Open http://localhost:8080. It only calls the API.
+  web:
+    build: ./frontend
+    restart: unless-stopped
+    ports:
+      - "${WEB_PORT:-8080}:80"
+    depends_on:
+      - api
+
+  # Automated tests against real PostgreSQL + Redis: docker compose run --rm test
+  test:
+    build:
+      context: ./backend
+      target: dev
+    profiles: ["test"]
+    command: ["npm", "test"]
+    environment:
+      DATABASE_URL: postgres://loopr:loopr@postgres:5432/loopr_test
+      REDIS_URL: redis://redis:6379
+      LOG_LEVEL: silent
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  pg-data:
+  export-data:
